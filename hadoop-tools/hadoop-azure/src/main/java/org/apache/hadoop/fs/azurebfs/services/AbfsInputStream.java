@@ -22,7 +22,15 @@ import java.io.EOFException;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.HttpURLConnection;
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Consumer;
+import java.util.function.IntFunction;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.classification.VisibleForTesting;
@@ -36,8 +44,11 @@ import org.slf4j.LoggerFactory;
 import org.apache.hadoop.fs.CanUnbuffer;
 import org.apache.hadoop.fs.FSExceptionMessages;
 import org.apache.hadoop.fs.FSInputStream;
+import org.apache.hadoop.fs.FileRange;
 import org.apache.hadoop.fs.FileSystem.Statistics;
 import org.apache.hadoop.fs.StreamCapabilities;
+import org.apache.hadoop.fs.VectoredReadUtils;
+import org.apache.hadoop.fs.impl.CombinedFileRange;
 import org.apache.hadoop.fs.azurebfs.constants.FSOperationType;
 import org.apache.hadoop.fs.azurebfs.contracts.exceptions.AbfsRestOperationException;
 import org.apache.hadoop.fs.azurebfs.contracts.exceptions.AzureBlobFileSystemException;
@@ -130,6 +141,16 @@ public class AbfsInputStream extends FSInputStream implements CanUnbuffer,
 
   /** ABFS instance to be held by the input stream to avoid GC close. */
   private final BackReference fsBackRef;
+
+  /**
+   * Thread pool for vectored IO operations.
+   */
+  private static final ExecutorService VECTORED_READ_THREAD_POOL = 
+      Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "abfs-vectored-read");
+        t.setDaemon(true);
+        return t;
+      });
 
   public AbfsInputStream(
           final AbfsClient client,
@@ -903,6 +924,201 @@ public class AbfsInputStream extends FSInputStream implements CanUnbuffer,
   @Override
   public int maxReadSizeForVectorReads() {
     return S_2M;
+  }
+
+  /**
+   * {@inheritDoc}
+   * 
+   * Vectored read implementation for ABFS. This method reads multiple ranges
+   * from the file in parallel to improve performance compared to sequential reads.
+   * 
+   * @param ranges the byte ranges to read
+   * @param allocate the function to allocate ByteBuffer
+   * @throws IOException if an I/O error occurs
+   */
+  @Override
+  public void readVectored(List<? extends FileRange> ranges,
+                           IntFunction<ByteBuffer> allocate) throws IOException {
+    LOG.debug("Starting vectored read for path {} with {} ranges", path, ranges.size());
+    
+    // Check if stream is closed
+    synchronized (this) {
+      if (closed) {
+        throw new IOException(FSExceptionMessages.STREAM_IS_CLOSED);
+      }
+    }
+    
+    // Validate and sort ranges
+    List<? extends FileRange> sortedRanges = VectoredReadUtils.validateAndSortRanges(ranges,
+        Optional.empty());
+    
+    // Set up futures for all ranges
+    for (FileRange range : sortedRanges) {
+      range.setData(new CompletableFuture<>());
+    }
+
+    if (sortedRanges.isEmpty()) {
+      return;
+    }
+
+    try {
+      if (VectoredReadUtils.isOrderedDisjoint(sortedRanges, 1, minSeekForVectorReads())) {
+        // Ranges are already optimally ordered and don't need merging
+        LOG.debug("Ranges are disjoint, reading {} ranges separately", sortedRanges.size());
+        for (FileRange range : sortedRanges) {
+          VECTORED_READ_THREAD_POOL.submit(() -> readSingleRange(range, allocate));
+        }
+      } else {
+        // Ranges can benefit from merging to reduce the number of remote calls
+        LOG.debug("Merging ranges to optimize read operations");
+        List<CombinedFileRange> combinedRanges = VectoredReadUtils.mergeSortedRanges(
+            sortedRanges, 1, minSeekForVectorReads(), maxReadSizeForVectorReads());
+        
+        LOG.debug("Merged {} original ranges into {} combined ranges", 
+                  sortedRanges.size(), combinedRanges.size());
+        
+        for (CombinedFileRange combinedRange : combinedRanges) {
+          VECTORED_READ_THREAD_POOL.submit(() -> readCombinedRange(combinedRange, allocate));
+        }
+      }
+    } catch (Exception e) {
+      // Complete all futures exceptionally
+      for (FileRange range : sortedRanges) {
+        range.getData().completeExceptionally(e);
+      }
+      throw new IOException("Failed to initiate vectored reads for path " + path, e);
+    }
+    
+    LOG.debug("Submitted all vectored read tasks for path {}", path);
+  }
+
+  /**
+   * Reads a single range and completes its future.
+   * 
+   * @param range the range to read
+   * @param allocate the buffer allocator
+   */
+  private void readSingleRange(FileRange range, IntFunction<ByteBuffer> allocate) {
+    LOG.debug("Reading single range: offset={}, length={}", range.getOffset(), range.getLength());
+    
+    try {
+      validateRangeRequest(range);
+      ByteBuffer buffer = allocate.apply(range.getLength());
+      
+      if (range.getLength() == 0) {
+        buffer.limit(0);
+        range.getData().complete(buffer);
+        return;
+      }
+      
+      // Read data into a temporary byte array
+      byte[] tempArray = new byte[range.getLength()];
+      int bytesRead = readRemote(range.getOffset(), tempArray, 0, range.getLength(), 
+                                 new TracingContext(tracingContext));
+      
+      if (bytesRead < 0) {
+        range.getData().completeExceptionally(
+            new EOFException("Reached end of file for range [" + range.getOffset() + 
+                           ", " + (range.getOffset() + range.getLength()) + ")"));
+        return;
+      }
+      
+      // Put data into the allocated buffer (handles both direct and array buffers)
+      buffer.put(tempArray, 0, bytesRead);
+      buffer.flip();
+      range.getData().complete(buffer);
+      
+    } catch (Exception e) {
+      LOG.warn("Failed to read range [{}:{}] for path {}", 
+               range.getOffset(), range.getLength(), path, e);
+      range.getData().completeExceptionally(e);
+    }
+  }
+
+  /**
+   * Reads a combined range and distributes the data to the underlying ranges.
+   * 
+   * @param combinedRange the combined range to read
+   * @param allocate the buffer allocator
+   */
+  private void readCombinedRange(CombinedFileRange combinedRange, IntFunction<ByteBuffer> allocate) {
+    LOG.debug("Reading combined range: offset={}, length={}", 
+              combinedRange.getOffset(), combinedRange.getLength());
+    
+    try {
+      validateRangeRequest(combinedRange);
+      
+      if (combinedRange.getLength() == 0) {
+        // Complete all underlying ranges with empty buffers
+        for (FileRange underlying : combinedRange.getUnderlying()) {
+          ByteBuffer emptyBuffer = allocate.apply(0);
+          emptyBuffer.limit(0);
+          underlying.getData().complete(emptyBuffer);
+        }
+        return;
+      }
+      
+      // Read the combined range data into a temporary array
+      byte[] tempArray = new byte[combinedRange.getLength()];
+      int bytesRead = readRemote(combinedRange.getOffset(), tempArray, 0, 
+                                 combinedRange.getLength(), new TracingContext(tracingContext));
+      
+      if (bytesRead < 0) {
+        Exception eof = new EOFException("Reached end of file for combined range [" + 
+                                       combinedRange.getOffset() + ", " + 
+                                       (combinedRange.getOffset() + combinedRange.getLength()) + ")");
+        for (FileRange underlying : combinedRange.getUnderlying()) {
+          underlying.getData().completeExceptionally(eof);
+        }
+        return;
+      }
+      
+      // Create a buffer with the read data for slicing
+      ByteBuffer combinedBuffer = ByteBuffer.wrap(tempArray, 0, bytesRead);
+      
+      // Slice the combined buffer to satisfy individual range requests
+      for (FileRange underlying : combinedRange.getUnderlying()) {
+        try {
+          ByteBuffer slicedBuffer = VectoredReadUtils.sliceTo(combinedBuffer, 
+                                                               combinedRange.getOffset(), 
+                                                               underlying);
+          
+          // If the user requested a different buffer type, transfer the data
+          ByteBuffer userBuffer = allocate.apply(underlying.getLength());
+          byte[] sliceData = new byte[slicedBuffer.remaining()];
+          slicedBuffer.get(sliceData);
+          userBuffer.put(sliceData);
+          userBuffer.flip();
+          
+          underlying.getData().complete(userBuffer);
+        } catch (Exception e) {
+          underlying.getData().completeExceptionally(e);
+        }
+      }
+      
+    } catch (Exception e) {
+      LOG.warn("Failed to read combined range [{}:{}] for path {}", 
+               combinedRange.getOffset(), combinedRange.getLength(), path, e);
+      for (FileRange underlying : combinedRange.getUnderlying()) {
+        underlying.getData().completeExceptionally(e);
+      }
+    }
+  }
+
+  /**
+   * Validates a range request to ensure it's within file bounds.
+   * 
+   * @param range the range to validate
+   * @throws EOFException if the range extends beyond the file
+   */
+  private void validateRangeRequest(FileRange range) throws EOFException {
+    VectoredReadUtils.validateRangeRequest(range);
+    
+    if (range.getOffset() + range.getLength() > contentLength) {
+      throw new EOFException("Range [" + range.getOffset() + ", " + 
+                            (range.getOffset() + range.getLength()) + 
+                            ") extends beyond file length " + contentLength);
+    }
   }
 
 }
