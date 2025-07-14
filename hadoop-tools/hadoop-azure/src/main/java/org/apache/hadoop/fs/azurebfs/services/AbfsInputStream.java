@@ -941,6 +941,13 @@ public class AbfsInputStream extends FSInputStream implements CanUnbuffer,
                            IntFunction<ByteBuffer> allocate) throws IOException {
     LOG.debug("Starting vectored read for path {} with {} ranges", path, ranges.size());
     
+    // Check if stream is closed
+    synchronized (this) {
+      if (closed) {
+        throw new IOException(FSExceptionMessages.STREAM_IS_CLOSED);
+      }
+    }
+    
     // Validate and sort ranges
     List<? extends FileRange> sortedRanges = VectoredReadUtils.validateAndSortRanges(ranges,
         Optional.empty());
